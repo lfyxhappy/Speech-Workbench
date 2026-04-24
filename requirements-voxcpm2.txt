@@ -1,0 +1,7 @@
+numpy
+soundfile
+einops
+transformers
+librosa
+safetensors
+torchcodec

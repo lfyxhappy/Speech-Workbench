@@ -1,0 +1,5 @@
+-r requirements-voxcpm2.txt
+PyQt6
+faster-whisper
+git+https://github.com/openai/whisper.git
+tiktoken
