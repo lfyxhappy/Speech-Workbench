@@ -3,3 +3,6 @@ PyQt6
 faster-whisper
 git+https://github.com/openai/whisper.git
 tiktoken
+diffusers
+accelerate
+sentencepiece

@@ -41,6 +41,19 @@ from PyQt6.QtWidgets import (
 )
 
 from app_shared import CancelToken, QueueTaskRecord, TaskCancelledError, TaskProgress, format_timestamp
+from audiofx_service import (
+    DEFAULT_AUDIOFX_DURATION_SECONDS,
+    DEFAULT_AUDIOFX_GUIDANCE_SCALE,
+    DEFAULT_AUDIOFX_STEPS,
+    DEFAULT_AUDIOFX_VARIANTS,
+    AudioFxRequest,
+    AudioFxResult,
+    build_audiofx_output_path,
+    check_audiofx_environment,
+    generate_audiofx,
+    get_default_audiofx_model_dir,
+    get_default_audiofx_output_dir,
+)
 from asr_service import (
     ASR_MODEL_FASTER,
     ASR_MODEL_OPENAI,
@@ -213,6 +226,8 @@ class TaskWorker(QObject):
             elif job_kind == "prompt_fill":
                 result = transcribe_audio(payload, progress_callback=lambda item: self.progress.emit(task_id, item), cancel_token=cancel_token)
                 result = PromptFillResult(text=result.text, model_kind=result.model_kind)
+            elif job_kind == "audiofx":
+                result = generate_audiofx(payload, progress_callback=lambda item: self.progress.emit(task_id, item), cancel_token=cancel_token)
             else:
                 raise ValueError(f"未知任务类型：{job_kind}")
             self.finished.emit(task_id, result)
@@ -329,7 +344,7 @@ class QueueController(QObject):
         record = self.record_map.get(task_id)
         if record:
             record.status = "completed"
-            if isinstance(result, (GenerateResult, TranscribeResult)):
+            if isinstance(result, (GenerateResult, TranscribeResult, AudioFxResult)):
                 record.output_path = result.output_path
             self.result.emit(record, result)
         self.current_job = None
@@ -1334,6 +1349,472 @@ class SttPage(QWidget):
                 os.startfile(output_dir)
 
 
+class AudioFxPage(QWidget):
+    def __init__(self, queue_controller: QueueController, app_settings: dict[str, object], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.queue_controller = queue_controller
+        self.app_settings = app_settings
+        self.current_output_path: Path | None = None
+
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(0.9)
+        self.media_player = QMediaPlayer(self)
+        self.media_player.setAudioOutput(self.audio_output)
+
+        self._build_ui()
+        self._load_settings()
+        self._refresh_environment()
+        self._prepare_player(None)
+
+        self.model_path_field.line_edit.textChanged.connect(self._refresh_environment)
+        self.use_gpu_check.stateChanged.connect(self._refresh_environment)
+        self.cpu_offload_check.stateChanged.connect(self._refresh_environment)
+        self.result_list.currentItemChanged.connect(self._on_result_selected)
+
+        self.queue_controller.queue_changed.connect(self._refresh_queue)
+        self.queue_controller.current_job_changed.connect(self._refresh_queue)
+        self.queue_controller.progress.connect(self._on_queue_progress)
+        self.queue_controller.result.connect(self._on_queue_result)
+        self.queue_controller.failed.connect(self._on_queue_failed)
+        self.queue_controller.cancelled.connect(self._on_queue_cancelled)
+        self._refresh_queue()
+
+    def shutdown(self) -> None:
+        self.media_player.stop()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        warning = QLabel("提示：音效生成会占用较多显存。批量生成时建议先用 3 到 5 秒短音频试参，再放大时长。")
+        warning.setStyleSheet("color: #8a4b08;")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+        splitter.addWidget(self._build_input_panel())
+        splitter.addWidget(self._build_result_panel())
+        splitter.setSizes([620, 760])
+        self._install_tooltips()
+
+    def _build_input_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        prompt_group = QGroupBox("批量提示词")
+        prompt_layout = QVBoxLayout(prompt_group)
+        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit.setPlaceholderText(
+            "一行一个音效提示词，建议使用英文更稳定。\n"
+            "gentle rain on a window, soft ambience\n"
+            "small brass bell ringing once in a quiet room\n"
+            "footsteps on wet stone, distant cave reverb"
+        )
+        prompt_layout.addWidget(self.prompt_edit)
+        layout.addWidget(prompt_group, 1)
+
+        settings_group = QGroupBox("生成参数")
+        settings_form = QFormLayout(settings_group)
+        self.model_path_field = PathField("选择模型", pick_directory=True)
+        self.model_path_field.setText(str(get_default_audiofx_model_dir()))
+        self.output_dir_field = PathField("选择目录", pick_directory=True)
+        self.output_dir_field.setText(str(get_default_audiofx_output_dir()))
+
+        self.duration_spin = QDoubleSpinBox()
+        self.duration_spin.setRange(1.0, 60.0)
+        self.duration_spin.setSingleStep(1.0)
+        self.duration_spin.setDecimals(1)
+        self.duration_spin.setSuffix(" 秒")
+        self.duration_spin.setValue(DEFAULT_AUDIOFX_DURATION_SECONDS)
+
+        self.steps_spin = QSpinBox()
+        self.steps_spin.setRange(1, 200)
+        self.steps_spin.setValue(DEFAULT_AUDIOFX_STEPS)
+
+        self.guidance_spin = QDoubleSpinBox()
+        self.guidance_spin.setRange(0.1, 20.0)
+        self.guidance_spin.setSingleStep(0.1)
+        self.guidance_spin.setDecimals(2)
+        self.guidance_spin.setValue(DEFAULT_AUDIOFX_GUIDANCE_SCALE)
+
+        self.seed_edit = QLineEdit()
+        self.seed_edit.setPlaceholderText("留空表示随机")
+
+        self.variants_spin = QSpinBox()
+        self.variants_spin.setRange(1, 20)
+        self.variants_spin.setValue(DEFAULT_AUDIOFX_VARIANTS)
+
+        self.use_gpu_check = QCheckBox("使用 GPU（CUDA）")
+        self.use_gpu_check.setChecked(True)
+        self.cpu_offload_check = QCheckBox("启用 CPU offload（显存紧张时使用）")
+        self.auto_play_check = QCheckBox("生成完成后自动播放")
+        self.auto_play_check.setChecked(True)
+
+        settings_form.addRow("模型目录", self.model_path_field)
+        settings_form.addRow("输出目录", self.output_dir_field)
+        settings_form.addRow("音频时长", self.duration_spin)
+        settings_form.addRow("推理步数", self.steps_spin)
+        settings_form.addRow("Guidance Scale", self.guidance_spin)
+        settings_form.addRow("随机种子", self.seed_edit)
+        settings_form.addRow("每条生成数量", self.variants_spin)
+        settings_form.addRow("", self.use_gpu_check)
+        settings_form.addRow("", self.cpu_offload_check)
+        settings_form.addRow("", self.auto_play_check)
+        layout.addWidget(settings_group)
+
+        button_row = QHBoxLayout()
+        self.enqueue_button = QPushButton("加入队列")
+        self.preview_button = QPushButton("生成试听")
+        self.open_dir_button = QPushButton("打开输出目录")
+        self.enqueue_button.setStyleSheet("font-size: 16px; padding: 12px 20px;")
+        self.preview_button.setStyleSheet("font-size: 16px; padding: 12px 20px;")
+        button_row.addWidget(self.enqueue_button)
+        button_row.addWidget(self.preview_button)
+        button_row.addWidget(self.open_dir_button)
+        layout.addLayout(button_row)
+
+        self.enqueue_button.clicked.connect(self.on_enqueue_clicked)
+        self.preview_button.clicked.connect(self.on_preview_clicked)
+        self.open_dir_button.clicked.connect(self.open_output_directory)
+        return panel
+
+    def _build_result_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        result_group = QGroupBox("状态与结果")
+        result_layout = QVBoxLayout(result_group)
+        self.environment_label = QLabel()
+        self.environment_label.setWordWrap(True)
+        self.stage_label = QLabel("就绪")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.result_list = QListWidget()
+        self.output_file_edit = QLineEdit()
+        self.output_file_edit.setReadOnly(True)
+
+        play_row = QHBoxLayout()
+        self.play_button = QPushButton("播放选中")
+        self.stop_button = QPushButton("停止")
+        self.open_file_button = QPushButton("打开文件")
+        self.open_result_dir_button = QPushButton("打开目录")
+        play_row.addWidget(self.play_button)
+        play_row.addWidget(self.stop_button)
+        play_row.addWidget(self.open_file_button)
+        play_row.addWidget(self.open_result_dir_button)
+
+        self.queue_panel = QueuePanel("音效生成队列")
+        self.queue_panel.cancel_button.setText("取消当前任务")
+        self.queue_panel.clear_button.setText("清理已完成")
+        self.queue_panel.cancel_current_requested.connect(self.queue_controller.cancel_current)
+        self.queue_panel.clear_finished_requested.connect(self.queue_controller.clear_finished)
+        self.queue_panel.remove_requested.connect(self.queue_controller.remove_record)
+
+        result_layout.addWidget(QLabel("环境状态"))
+        result_layout.addWidget(self.environment_label)
+        result_layout.addWidget(QLabel("当前阶段"))
+        result_layout.addWidget(self.stage_label)
+        result_layout.addWidget(self.progress_bar)
+        result_layout.addWidget(QLabel("日志"))
+        result_layout.addWidget(self.log_edit, 1)
+        result_layout.addWidget(QLabel("结果列表"))
+        result_layout.addWidget(self.result_list, 1)
+        result_layout.addWidget(QLabel("当前音频"))
+        result_layout.addWidget(self.output_file_edit)
+        result_layout.addLayout(play_row)
+        result_layout.addWidget(self.queue_panel, 1)
+        layout.addWidget(result_group, 1)
+
+        self.play_button.clicked.connect(self.play_output)
+        self.stop_button.clicked.connect(self.media_player.stop)
+        self.open_file_button.clicked.connect(self.open_output_file)
+        self.open_result_dir_button.clicked.connect(self.open_output_directory)
+        return panel
+
+    def _install_tooltips(self) -> None:
+        self.prompt_edit.setToolTip("一行一个音效提示词，空行会自动忽略。AudioLDM2 对英文提示词通常更稳定。")
+        self.model_path_field.setToolTip("本地 AudioLDM2 模型目录。默认读取项目上级 model\\AudioLDM2，不会运行时联网。")
+        self.output_dir_field.setToolTip("生成 WAV 素材的保存目录。默认是当前应用 outputs\\sfx。")
+        self.duration_spin.setToolTip("单条音效目标时长。首次试参建议 3 到 5 秒，满意后再增加。")
+        self.steps_spin.setToolTip("推理步数。越高越慢，细节可能更稳；默认 50。")
+        self.guidance_spin.setToolTip("提示词遵从强度。默认 3.5，太高可能声音更僵硬。")
+        self.seed_edit.setToolTip("固定种子可以复现相近结果；留空时每个任务随机。填写种子后，批量任务会自动递增避免完全相同。")
+        self.variants_spin.setToolTip("每条提示词生成几个版本。总任务数 = 提示词行数 x 每条生成数量。")
+        self.use_gpu_check.setToolTip("使用 CUDA 显卡生成。速度更快，但需要足够显存。")
+        self.cpu_offload_check.setToolTip("把部分模型权重在 CPU/GPU 间调度，可降低显存压力，但会变慢。")
+        self.auto_play_check.setToolTip("生成完成后自动播放最新结果。批量生成时可关闭。")
+        self.enqueue_button.setToolTip("把所有提示词按批量参数展开后加入音效生成队列。")
+        self.preview_button.setToolTip("只使用第一条有效提示词生成 1 个试听版本。")
+        self.open_dir_button.setToolTip("打开当前设置的输出目录。")
+        self.environment_label.setToolTip("显示 Python、CUDA、依赖和本地模型目录状态。")
+        self.result_list.setToolTip("展示已完成的音效结果。选中一条后可以直接播放或打开文件。")
+
+    def _settings_payload(self) -> dict[str, object]:
+        return {
+            "prompts": self.prompt_edit.toPlainText(),
+            "model_path": self.model_path_field.text(),
+            "output_dir": self.output_dir_field.text(),
+            "duration_seconds": self.duration_spin.value(),
+            "steps": self.steps_spin.value(),
+            "guidance_scale": self.guidance_spin.value(),
+            "seed": self.seed_edit.text().strip(),
+            "variants": self.variants_spin.value(),
+            "use_gpu": self.use_gpu_check.isChecked(),
+            "cpu_offload": self.cpu_offload_check.isChecked(),
+            "auto_play": self.auto_play_check.isChecked(),
+        }
+
+    def _load_settings(self) -> None:
+        payload = self.app_settings.get("audiofx", {})
+        if not isinstance(payload, dict):
+            return
+        self.prompt_edit.setPlainText(str(payload.get("prompts", "")))
+        self.model_path_field.setText(str(payload.get("model_path", str(get_default_audiofx_model_dir()))))
+        self.output_dir_field.setText(str(payload.get("output_dir", str(get_default_audiofx_output_dir()))))
+        self.duration_spin.setValue(float(payload.get("duration_seconds", DEFAULT_AUDIOFX_DURATION_SECONDS)))
+        self.steps_spin.setValue(int(payload.get("steps", DEFAULT_AUDIOFX_STEPS)))
+        self.guidance_spin.setValue(float(payload.get("guidance_scale", DEFAULT_AUDIOFX_GUIDANCE_SCALE)))
+        self.seed_edit.setText(str(payload.get("seed", "")))
+        self.variants_spin.setValue(int(payload.get("variants", DEFAULT_AUDIOFX_VARIANTS)))
+        self.use_gpu_check.setChecked(bool(payload.get("use_gpu", True)))
+        self.cpu_offload_check.setChecked(bool(payload.get("cpu_offload", False)))
+        self.auto_play_check.setChecked(bool(payload.get("auto_play", True)))
+
+    def save_settings(self) -> None:
+        self.app_settings["audiofx"] = self._settings_payload()
+
+    def _refresh_environment(self) -> None:
+        status = check_audiofx_environment(self.model_path_field.text() or str(get_default_audiofx_model_dir()))
+        lines = [f"AudioLDM2 Python: {status.python_version}"]
+        if status.cuda_available and status.gpu_name:
+            vram_text = f"{status.total_vram_gb:.1f} GB" if status.total_vram_gb else "未知显存"
+            lines.append(f"CUDA: 可用，GPU 为 {status.gpu_name}（{vram_text}）")
+        else:
+            lines.append("CUDA: 未检测到；如果勾选使用 GPU，生成会被阻止。")
+        lines.append("AudioLDM2 依赖检查通过。" if not status.missing_packages else "缺少 AudioLDM2 依赖：" + ", ".join(status.missing_packages))
+        lines.append(
+            "模型目录："
+            + (
+                f"{status.default_model_path}（已找到）"
+                if status.model_exists and status.model_index_exists
+                else f"{status.default_model_path}（未找到或缺少 model_index.json）"
+            )
+        )
+        if self.use_gpu_check.isChecked() and not status.cuda_available:
+            lines.append("当前勾选了使用 GPU，但 CUDA 不可用。")
+
+        ready = not status.missing_packages and status.model_exists and status.model_index_exists
+        if self.use_gpu_check.isChecked() and not status.cuda_available:
+            ready = False
+        self.environment_label.setStyleSheet("color: #0b7a0b;" if ready else "color: #b42318;")
+        self.environment_label.setText("\n".join(lines))
+
+    def _append_log(self, message: str) -> None:
+        self.log_edit.append(message)
+
+    def _parse_prompts(self) -> list[str]:
+        return [line.strip() for line in self.prompt_edit.toPlainText().splitlines() if line.strip()]
+
+    def _parse_seed(self) -> tuple[bool, str, int | None]:
+        raw_seed = self.seed_edit.text().strip()
+        if not raw_seed:
+            return True, "", None
+        try:
+            seed = int(raw_seed)
+        except ValueError:
+            return False, "随机种子必须是整数，或留空表示随机。", None
+        if seed < 0:
+            return False, "随机种子不能为负数。", None
+        return True, "", seed
+
+    def _validate_form(self) -> tuple[bool, str, list[str], int | None]:
+        prompts = self._parse_prompts()
+        if not prompts:
+            return False, "请至少输入一条音效提示词。", [], None
+
+        output_dir = Path(self.output_dir_field.text()).expanduser()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"输出目录无法创建或访问：{exc}", [], None
+
+        model_dir = Path(self.model_path_field.text()).expanduser()
+        if not model_dir.exists():
+            return False, "模型目录不存在，请确认 AudioLDM2 所在位置。", [], None
+        if not (model_dir / "model_index.json").exists():
+            return False, "模型目录缺少 model_index.json，请确认选择的是 AudioLDM2 根目录。", [], None
+
+        valid_seed, seed_error, seed = self._parse_seed()
+        if not valid_seed:
+            return False, seed_error, [], None
+
+        status = check_audiofx_environment(str(model_dir))
+        if status.missing_packages:
+            return False, "缺少 AudioLDM2 依赖：" + ", ".join(status.missing_packages), [], None
+        if self.use_gpu_check.isChecked() and not status.cuda_available:
+            return False, "当前 CUDA 不可用，请取消“使用 GPU”后使用 CPU，或检查 CUDA 版 PyTorch。", [], None
+        return True, "", prompts, seed
+
+    def _set_form_busy(self, busy: bool) -> None:
+        widgets = [
+            self.prompt_edit,
+            self.model_path_field,
+            self.output_dir_field,
+            self.duration_spin,
+            self.steps_spin,
+            self.guidance_spin,
+            self.seed_edit,
+            self.variants_spin,
+            self.use_gpu_check,
+            self.cpu_offload_check,
+            self.auto_play_check,
+            self.enqueue_button,
+            self.preview_button,
+        ]
+        for widget in widgets:
+            widget.setEnabled(not busy)
+
+    def _enqueue_prompts(self, prompts: list[str], base_seed: int | None, variants: int, preview: bool = False) -> None:
+        sequence_index = 0
+        for prompt in prompts:
+            for _variant_index in range(variants):
+                sequence_index += 1
+                seed = base_seed + sequence_index - 1 if base_seed is not None else None
+                output_path = build_audiofx_output_path(
+                    self.output_dir_field.text(),
+                    prompt,
+                    sequence_index=sequence_index,
+                )
+                request = AudioFxRequest(
+                    prompt=prompt,
+                    model_path=self.model_path_field.text().strip(),
+                    output_path=str(output_path),
+                    duration_seconds=self.duration_spin.value(),
+                    steps=self.steps_spin.value(),
+                    guidance_scale=self.guidance_spin.value(),
+                    seed=seed,
+                    use_gpu=self.use_gpu_check.isChecked(),
+                    cpu_offload=self.cpu_offload_check.isChecked(),
+                    sequence_index=sequence_index,
+                )
+                title_prefix = "试听" if preview else f"{sequence_index:03d}"
+                title = f"{title_prefix} {prompt[:24]}"
+                record = QueueTaskRecord(
+                    task_id=uuid.uuid4().hex,
+                    page_kind="audiofx",
+                    status="queued",
+                    title=title,
+                    input_path=prompt,
+                    output_path=str(output_path),
+                )
+                self.queue_controller.add_job(QueueJob(record=record, payload=request, cancel_token=CancelToken(), kind="audiofx"))
+                self._append_log(f"已加入队列：{title}")
+
+    def on_enqueue_clicked(self) -> None:
+        valid, error_message, prompts, seed = self._validate_form()
+        if not valid:
+            QMessageBox.warning(self, "参数错误", error_message)
+            self._refresh_environment()
+            return
+        self._enqueue_prompts(prompts, seed, self.variants_spin.value(), preview=False)
+
+    def on_preview_clicked(self) -> None:
+        valid, error_message, prompts, seed = self._validate_form()
+        if not valid:
+            QMessageBox.warning(self, "参数错误", error_message)
+            self._refresh_environment()
+            return
+        self._enqueue_prompts(prompts[:1], seed, 1, preview=True)
+
+    def _refresh_queue(self) -> None:
+        self.queue_panel.refresh(self.queue_controller.records, self.queue_controller.current_job.record if self.queue_controller.current_job else None)
+        self._set_form_busy(bool(self.queue_controller.current_job))
+
+    def _on_queue_progress(self, record: QueueTaskRecord, progress_item: TaskProgress) -> None:
+        if record.page_kind != "audiofx":
+            return
+        self.stage_label.setText(progress_item.message)
+        if progress_item.percent is not None:
+            self.progress_bar.setValue(progress_item.percent)
+        self._append_log(f"[{record.title}] {progress_item.message}")
+
+    def _on_queue_result(self, record: QueueTaskRecord, result: object) -> None:
+        if record.page_kind != "audiofx" or not isinstance(result, AudioFxResult):
+            return
+        self.current_output_path = Path(result.output_path)
+        self.output_file_edit.setText(result.output_path)
+        self.progress_bar.setValue(100)
+        self.stage_label.setText(f"音效生成完成，时长约 {result.duration_seconds:.1f} 秒，采样率 {result.sample_rate} Hz。")
+        item_text = (
+            f"[完成] {result.prompt} | {result.duration_seconds:.1f}s | "
+            f"{result.sample_rate} Hz | seed={result.seed} | {Path(result.output_path).name}"
+        )
+        item = QListWidgetItem(item_text)
+        item.setData(Qt.ItemDataRole.UserRole, result.output_path)
+        self.result_list.addItem(item)
+        self.result_list.setCurrentItem(item)
+        self._append_log(f"[{record.title}] 已保存：{result.output_path}")
+        self._prepare_player(self.current_output_path)
+        if self.auto_play_check.isChecked():
+            self.play_output()
+        self._refresh_environment()
+        self._set_form_busy(False)
+
+    def _on_queue_failed(self, record: QueueTaskRecord, message: str) -> None:
+        if record.page_kind != "audiofx":
+            return
+        self.stage_label.setText("音效生成失败")
+        self._append_log(f"[{record.title}] 生成失败：{message}")
+        self._refresh_environment()
+        self._set_form_busy(False)
+
+    def _on_queue_cancelled(self, record: QueueTaskRecord, message: str) -> None:
+        if record.page_kind != "audiofx":
+            return
+        self.stage_label.setText("任务已取消")
+        self._append_log(f"[{record.title}] {message}")
+        self._set_form_busy(False)
+
+    def _prepare_player(self, output_path: Path | None) -> None:
+        if output_path and output_path.exists():
+            self.media_player.setSource(QUrl.fromLocalFile(str(output_path)))
+            enabled = True
+        else:
+            enabled = False
+        self.play_button.setEnabled(enabled)
+        self.stop_button.setEnabled(enabled)
+        self.open_file_button.setEnabled(enabled)
+        self.open_result_dir_button.setEnabled(enabled)
+
+    def _on_result_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            return
+        output_path = current.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(output_path, str):
+            return
+        self.current_output_path = Path(output_path)
+        self.output_file_edit.setText(output_path)
+        self._prepare_player(self.current_output_path)
+
+    def play_output(self) -> None:
+        if self.current_output_path and self.current_output_path.exists():
+            self._prepare_player(self.current_output_path)
+            self.media_player.play()
+
+    def open_output_file(self) -> None:
+        if self.current_output_path and self.current_output_path.exists():
+            os.startfile(self.current_output_path)
+
+    def open_output_directory(self) -> None:
+        if self.current_output_path and self.current_output_path.exists():
+            os.startfile(self.current_output_path.parent)
+            return
+        output_dir = Path(self.output_dir_field.text()).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        os.startfile(output_dir)
+
+
 class VoiceWorkbenchWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1345,6 +1826,7 @@ class VoiceWorkbenchWindow(QMainWindow):
 
         self.tts_queue_controller = QueueController(self)
         self.stt_queue_controller = QueueController(self)
+        self.audiofx_queue_controller = QueueController(self)
 
         self._build_ui()
         self._restore_window_placement()
@@ -1363,8 +1845,10 @@ class VoiceWorkbenchWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.tts_page = TtsPage(self.tts_queue_controller, self.app_settings, self)
         self.stt_page = SttPage(self.stt_queue_controller, self.app_settings, self)
+        self.audiofx_page = AudioFxPage(self.audiofx_queue_controller, self.app_settings, self)
         self.tab_widget.addTab(self.tts_page, "语音生成")
         self.tab_widget.addTab(self.stt_page, "语音转文本")
+        self.tab_widget.addTab(self.audiofx_page, "音效素材库")
         root_layout.addWidget(self.tab_widget, 1)
 
         app_settings = self.app_settings.get("app", {})
@@ -1373,22 +1857,24 @@ class VoiceWorkbenchWindow(QMainWindow):
 
     def _load_settings_payload(self) -> dict[str, object]:
         if not self.settings_path.exists():
-            return {"app": {}, "tts": {}, "stt": {}}
+            return {"app": {}, "tts": {}, "stt": {}, "audiofx": {}}
         try:
             payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
         except Exception:
-            return {"app": {}, "tts": {}, "stt": {}}
+            return {"app": {}, "tts": {}, "stt": {}, "audiofx": {}}
 
-        if "app" in payload or "tts" in payload or "stt" in payload:
+        if "app" in payload or "tts" in payload or "stt" in payload or "audiofx" in payload:
             payload.setdefault("app", {})
             payload.setdefault("tts", {})
             payload.setdefault("stt", {})
+            payload.setdefault("audiofx", {})
             return payload
 
         migrated = {
             "app": {"last_tab": 0},
             "tts": payload,
             "stt": {},
+            "audiofx": {},
         }
         return migrated
 
@@ -1436,6 +1922,7 @@ class VoiceWorkbenchWindow(QMainWindow):
             }
         self.tts_page.save_settings()
         self.stt_page.save_settings()
+        self.audiofx_page.save_settings()
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.write_text(json.dumps(self.app_settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1445,8 +1932,10 @@ class VoiceWorkbenchWindow(QMainWindow):
         self._shutdown_done = True
         self.save_settings()
         self.tts_page.shutdown()
+        self.audiofx_page.shutdown()
         self.tts_queue_controller.shutdown()
         self.stt_queue_controller.shutdown()
+        self.audiofx_queue_controller.shutdown()
 
     def closeEvent(self, event) -> None:
         self.shutdown()
@@ -1477,11 +1966,37 @@ def run_stt_self_test() -> None:
     print(f"STT 自检通过：{result.output_path}")
 
 
+def run_audiofx_self_test() -> None:
+    from audiofx_service import (
+        AudioFxRequest,
+        generate_audiofx,
+        get_default_audiofx_model_dir,
+        get_default_audiofx_output_dir,
+    )
+
+    output_path = get_default_audiofx_output_dir() / "selftest_audiofx.wav"
+    result = generate_audiofx(
+        AudioFxRequest(
+            prompt="gentle rain on a window, soft ambience",
+            model_path=str(get_default_audiofx_model_dir()),
+            output_path=str(output_path),
+            duration_seconds=2.0,
+            steps=4,
+            guidance_scale=3.5,
+            seed=20260425,
+            use_gpu=True,
+            cpu_offload=False,
+        )
+    )
+    print(f"AudioFX 自检通过：{result.output_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="语音生成与转写桌面 UI")
     parser.add_argument("--smoke-test", action="store_true", help="创建窗口并立即退出，用于验证 GUI 依赖是否完整。")
     parser.add_argument("--self-test-tts", action="store_true", help="执行一次无界面的 TTS 自检。")
     parser.add_argument("--self-test-stt", action="store_true", help="执行一次无界面的 STT 自检。")
+    parser.add_argument("--self-test-audiofx", action="store_true", help="执行一次无界面的 AudioLDM2 音效生成自检。")
     return parser
 
 
@@ -1492,6 +2007,9 @@ def main() -> int:
         return 0
     if args.self_test_stt:
         run_stt_self_test()
+        return 0
+    if args.self_test_audiofx:
+        run_audiofx_self_test()
         return 0
 
     app = QApplication([])

@@ -44,6 +44,48 @@ $Arguments = @(
     "--hidden-import", "faster_whisper",
     "--hidden-import", "ctranslate2",
     "--hidden-import", "tiktoken",
+    "--hidden-import", "diffusers",
+    "--hidden-import", "accelerate",
+    "--hidden-import", "sentencepiece",
+    "--hidden-import", "audiofx_service",
+    "--hidden-import", "diffusers.pipelines.audioldm2",
+    "--hidden-import", "diffusers.pipelines.audioldm2.pipeline_audioldm2",
+    "--exclude-module", "onnxruntime",
+    "--exclude-module", "onnxruntime-gpu",
+    "--exclude-module", "onnxruntime.training",
+    "--copy-metadata", "accelerate",
+    "--copy-metadata", "av",
+    "--copy-metadata", "certifi",
+    "--copy-metadata", "charset-normalizer",
+    "--copy-metadata", "ctranslate2",
+    "--copy-metadata", "diffusers",
+    "--copy-metadata", "faster-whisper",
+    "--copy-metadata", "filelock",
+    "--copy-metadata", "huggingface-hub",
+    "--copy-metadata", "httpcore",
+    "--copy-metadata", "httpx",
+    "--copy-metadata", "idna",
+    "--copy-metadata", "importlib-metadata",
+    "--copy-metadata", "librosa",
+    "--copy-metadata", "numpy",
+    "--copy-metadata", "openai-whisper",
+    "--copy-metadata", "packaging",
+    "--copy-metadata", "Pillow",
+    "--copy-metadata", "protobuf",
+    "--copy-metadata", "PyYAML",
+    "--copy-metadata", "regex",
+    "--copy-metadata", "requests",
+    "--copy-metadata", "safetensors",
+    "--copy-metadata", "scipy",
+    "--copy-metadata", "sentencepiece",
+    "--copy-metadata", "soundfile",
+    "--copy-metadata", "tokenizers",
+    "--copy-metadata", "torch",
+    "--copy-metadata", "torchcodec",
+    "--copy-metadata", "tqdm",
+    "--copy-metadata", "transformers",
+    "--copy-metadata", "urllib3",
+    "--copy-metadata", "zipp",
     "--collect-data", "PyQt6.QtMultimedia",
     "--collect-binaries", "PyQt6.QtMultimedia",
     $GuiEntry
@@ -91,7 +133,7 @@ if ($DryRun) {
     Write-Host "Will validate models under: $ModelRootCandidate"
     Write-Host "Will sync runtime exe to: $RuntimeExe"
     Write-Host "Will sync runtime internal dir to: $RuntimeInternal"
-    Write-Host "Will run: --smoke-test, --self-test-tts, --self-test-stt"
+    Write-Host "Will run: --smoke-test, --self-test-tts, --self-test-stt, --self-test-audiofx"
     exit 0
 }
 
@@ -101,6 +143,7 @@ if (-not $ModelRoot) {
 Assert-RequiredPath -PathValue (Join-Path $ModelRoot "VoxCPM2") -Label "VoxCPM2 模型目录"
 Assert-RequiredPath -PathValue (Join-Path $ModelRoot "Whisper-large-v3-turbo") -Label "Whisper-large-v3-turbo 模型目录"
 Assert-RequiredPath -PathValue (Join-Path $ModelRoot "faster-whisper-small") -Label "faster-whisper-small 模型目录"
+Assert-RequiredPath -PathValue (Join-Path $ModelRoot "AudioLDM2") -Label "AudioLDM2 模型目录"
 Assert-AppNotRunning
 
 & $Python @Arguments
@@ -131,6 +174,7 @@ Copy-Item -LiteralPath (Join-Path $DistDir "VoxCPM2Studio.exe") -Destination $Ru
 Invoke-AndAssertSuccess -Executable $RuntimeExe -Arguments @("--smoke-test") -ErrorMessage "打包版 smoke test 失败。"
 Invoke-AndAssertSuccess -Executable $RuntimeExe -Arguments @("--self-test-tts") -ErrorMessage "打包版 TTS 自检失败。"
 Invoke-AndAssertSuccess -Executable $RuntimeExe -Arguments @("--self-test-stt") -ErrorMessage "打包版 STT 自检失败。"
+Invoke-AndAssertSuccess -Executable $RuntimeExe -Arguments @("--self-test-audiofx") -ErrorMessage "打包版 AudioFX 自检失败。"
 
 Write-Host "打包完成：$DistDir"
 if (-not $CopyModel) {
