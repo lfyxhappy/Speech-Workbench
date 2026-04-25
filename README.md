@@ -1,9 +1,10 @@
 # Speech Workbench
 
-一个面向本地部署场景的中文语音工作台，提供两类核心能力：
+一个面向本地部署场景的中文语音工作台，提供三类核心能力：
 
 - `语音生成（TTS）`：基于本地 `VoxCPM2` 模型生成中文配音
 - `语音转文本（STT/ASR）`：基于本地 `Whisper-large-v3-turbo` 或 `faster-whisper-small` 模型转写音频
+- `音效素材库（AudioFX）`：基于本地 `AudioLDM2` 模型生成雨声、铃声、脚步声、环境音等非语音音效
 
 项目以 **Windows 桌面使用体验** 为优先目标，提供：
 
@@ -11,7 +12,7 @@
 - 保留源码方式运行
 - 可打包为离线使用的 `exe`
 - 本地模型目录识别
-- TTS / STT 双页面工作流
+- TTS / STT / AudioFX 三页面工作流
 - 各自独立的任务队列与后台线程
 
 这个仓库适合：
@@ -19,6 +20,7 @@
 - 做中文视频讲解配音
 - 本地批量测试音色和参数
 - 把微信语音、录音文件、音频素材转成文字
+- 批量生成游戏、视频或桌面应用可用的短音效素材
 - 做离线工具，不依赖网页服务
 
 ## 功能概览
@@ -49,12 +51,21 @@
   - 阅读预览
   - 时间轴预览
 
-### 3. 打包与发布
+### 3. 音效素材库
+
+- 支持 `AudioLDM2`
+- 一行一个提示词批量生成 `.wav`
+- 支持每条提示词生成多个版本
+- 可调音频时长、推理步数、guidance scale、随机种子
+- 支持 CUDA 与 CPU offload 选项
+- 生成结果列表内可直接试听
+
+### 4. 打包与发布
 
 - 提供 `PyInstaller` one-folder 打包方案
 - 自动同步根目录运行版
 - 自动执行打包后自检
-- 保持模型目录在 `exe` 外部，不把大模型权重塞进可执行文件
+- 保持模型目录在 `exe` 外部，不把大模型权重塞进发布包
 
 ## 目录结构
 
@@ -64,10 +75,11 @@
 ├─ tts_voxcpm2.py                   # 命令行 TTS 入口
 ├─ voxcpm_service.py                # TTS 服务层
 ├─ asr_service.py                   # STT/ASR 服务层
+├─ audiofx_service.py               # AudioLDM2 音效生成服务层
 ├─ app_shared.py                    # 公共数据结构与工具
 ├─ build_voxcpm_gui.ps1             # 打包脚本
 ├─ requirements-voxcpm2.txt         # TTS 最小依赖
-├─ requirements-voxcpm2-gui.txt     # GUI + STT 依赖
+├─ requirements-voxcpm2-gui.txt     # GUI + STT + AudioFX 依赖
 ├─ sample_text.txt                  # TTS 示例文案
 ├─ pyinstaller_hooks/               # PyInstaller hooks
 ├─ tests/                           # 单元测试
@@ -82,12 +94,15 @@
 ├─ model/
 │  ├─ VoxCPM2/
 │  ├─ Whisper-large-v3-turbo/
-│  └─ faster-whisper-small/
+│  ├─ faster-whisper-small/
+│  └─ AudioLDM2/
 └─ 语音生成/
    └─ ...
 ```
 
 程序会优先识别同级 `../model` 下的模型目录。
+
+GitHub Release 发布包只包含应用和运行依赖，不包含上述模型权重。请自行下载模型并按这个目录结构放到本地。
 
 ## 依赖环境
 
@@ -111,6 +126,9 @@ python -m pip install -r requirements-voxcpm2-gui.txt
 - `faster-whisper`
 - `openai-whisper`（通过 Git 安装）
 - `tiktoken`
+- `diffusers`
+- `accelerate`
+- `sentencepiece`
 
 如果 Hugging Face 下载慢，可以先设置镜像：
 
@@ -120,7 +138,7 @@ $env:HF_ENDPOINT="https://hf-mirror.com"
 
 ## 模型准备
 
-本项目默认使用以下三套本地模型：
+本项目默认使用以下四套本地模型，模型权重不会上传到 GitHub Release：
 
 ### TTS
 
@@ -131,11 +149,17 @@ $env:HF_ENDPOINT="https://hf-mirror.com"
 - `model/Whisper-large-v3-turbo`
 - `model/faster-whisper-small`
 
+### AudioFX
+
+- `model/AudioLDM2`
+
 其中 `Whisper-large-v3-turbo` 当前按本地权重文件方式加载：
 
 - `large-v3-turbo.pt`
 
 不依赖 `modelscope` 作为主运行链路。
+
+`AudioLDM2` 使用 `diffusers.AudioLDM2Pipeline` 通过本地路径加载，并设置 `local_files_only=True`，运行时不会主动联网下载模型。
 
 ## 快速开始
 
@@ -145,10 +169,11 @@ $env:HF_ENDPOINT="https://hf-mirror.com"
 python .\voxcpm_gui.py
 ```
 
-启动后会看到两个页面：
+启动后会看到三个页面：
 
 - `语音生成`
 - `语音转文本`
+- `音效素材库`
 
 ### 2. 命令行方式生成示例配音
 
@@ -177,6 +202,7 @@ python .\tts_voxcpm2.py --check-env
 python .\voxcpm_gui.py --smoke-test
 python .\voxcpm_gui.py --self-test-tts
 python .\voxcpm_gui.py --self-test-stt
+python .\voxcpm_gui.py --self-test-audiofx
 ```
 
 ## 语音生成说明
@@ -296,11 +322,12 @@ python .\voxcpm_gui.py --self-test-stt
 - 打包 `dist/VoxCPM2Studio`
 - 同步根目录 `VoxCPM2Studio.exe`
 - 同步根目录 `_internal`
-- 检查三套模型目录是否存在
+- 检查四套模型目录是否存在
 - 运行以下自检：
   - `--smoke-test`
   - `--self-test-tts`
   - `--self-test-stt`
+  - `--self-test-audiofx`
 
 如果只想预览动作而不执行：
 
@@ -308,11 +335,13 @@ python .\voxcpm_gui.py --self-test-stt
 .\build_voxcpm_gui.ps1 -DryRun
 ```
 
-如果想把 TTS 模型一起复制到打包目录：
+如果只在本机自用，也可以把 `VoxCPM2` TTS 模型复制到打包目录：
 
 ```powershell
 .\build_voxcpm_gui.ps1 -CopyModel
 ```
+
+正式发布到 GitHub 时不建议使用 `-CopyModel`，本项目的 Release 包默认不包含任何模型权重。
 
 ## 测试
 
@@ -357,4 +386,4 @@ python -m unittest discover -s tests -p "test_*.py"
 
 ---
 
-如果你想把它当成一个真正长期维护的桌面工具，这个仓库现在已经具备一个比较完整的起点：本地模型、双页面 UI、可打包、可离线运行、并且围绕中文使用场景做了不少细节优化。
+如果你想把它当成一个真正长期维护的桌面工具，这个仓库现在已经具备一个比较完整的起点：本地模型、三页面 UI、可打包、可离线运行、并且围绕中文使用场景做了不少细节优化。
